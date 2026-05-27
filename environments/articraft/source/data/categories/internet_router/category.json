@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "slug": "internet_router",
+  "title": "Internet Router",
+  "description": "",
+  "target_sdk_version": "base"
+}

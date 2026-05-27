@@ -1,5 +1,16 @@
 # Phase 1 计划 vs 实现：偏差记录
 
+> **✅ Phase 1 已完成验证 (2026-05-25)**
+> 
+> KAOLA 8-GPU 训练成功启动并完成 Step 0。所有「需要 KAOLA 验证的项目」已确认通过：
+> 1. tool_defs dict 格式被 verifiers 正确接受 ✅
+> 2. env_response dict 消息被 TITO 正确处理 ✅
+> 3. JSON wrapped tool content 与 vLLM chat template 兼容 ✅
+> 4. tool_call accessor 实际走 dict 路径（Pydantic 路径未触发）✅
+> 
+> **后续问题**：训练因 OOM 失败（seq_len=32K 下 backward pass 超出 GPU 内存），
+> 根因是 rollout 平均 64K tokens，需要 Phase 2 Feature #6 (Context Window Management) 解决。
+
 **日期**: 2026-05-25
 **计划文件**: `.agents/plans/articraft-env-integration_v2.md`
 **实现 commit**: Phase 1 全部代码

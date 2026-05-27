@@ -99,12 +99,14 @@ class ArticraftRubric(vf.Rubric):
         self.add_metric(self.turns_used)
         self.add_metric(self.compile_latency_ms)
         self.add_metric(self.trajectory_token_estimate)
+        self.add_metric(self.compaction_count)
+        self.add_metric(self.consecutive_compile_failures)
 
     # ---- reward functions ----
 
     async def check_fraction_reward(self, state: vf.State, **kwargs: Any) -> float:
         rollout = require_rollout(state)
-        bundle_dict = rollout.last_compile_attempt_dict
+        bundle_dict = rollout.compile.last_attempt_dict
         if bundle_dict is None:
             return 0.0
         bundle = CompileSignalBundle.from_dict(bundle_dict)
@@ -116,7 +118,7 @@ class ArticraftRubric(vf.Rubric):
 
     async def build_success_bonus(self, state: vf.State, **kwargs: Any) -> float:
         rollout = require_rollout(state)
-        bundle_dict = rollout.last_compile_attempt_dict
+        bundle_dict = rollout.compile.last_attempt_dict
         if bundle_dict is None:
             return 0.0
         bundle = CompileSignalBundle.from_dict(bundle_dict)
@@ -133,7 +135,7 @@ class ArticraftRubric(vf.Rubric):
 
     async def blocking_failure_count(self, state: vf.State, **kwargs: Any) -> float:
         rollout = require_rollout(state)
-        bd = rollout.last_compile_attempt_dict
+        bd = rollout.compile.last_attempt_dict
         if bd is None:
             return 0.0
         bundle = CompileSignalBundle.from_dict(bd)
@@ -141,7 +143,7 @@ class ArticraftRubric(vf.Rubric):
 
     async def warning_count(self, state: vf.State, **kwargs: Any) -> float:
         rollout = require_rollout(state)
-        bd = rollout.last_compile_attempt_dict
+        bd = rollout.compile.last_attempt_dict
         if bd is None:
             return 0.0
         bundle = CompileSignalBundle.from_dict(bd)
@@ -153,7 +155,7 @@ class ArticraftRubric(vf.Rubric):
 
     async def compile_latency_ms(self, state: vf.State, **kwargs: Any) -> float:
         rollout = require_rollout(state)
-        return rollout.last_compile_latency_ms or 0.0
+        return rollout.compile.last_latency_ms or 0.0
 
     async def trajectory_token_estimate(self, state: vf.State, **kwargs: Any) -> float:
         """Rough token estimate for context pressure tracking."""
@@ -161,19 +163,29 @@ class ArticraftRubric(vf.Rubric):
         text = json.dumps(trajectory, default=str)
         return len(text) / 4.0
 
+    async def compaction_count(self, state: vf.State, **kwargs: Any) -> float:
+        rollout = require_rollout(state)
+        return float(rollout.compaction.count)
+
+    async def consecutive_compile_failures(self, state: vf.State, **kwargs: Any) -> float:
+        rollout = require_rollout(state)
+        return float(rollout.compile.consecutive_failure_count)
+
     # ---- cleanup ----
 
     @vf.cleanup
     async def write_artifacts_handler(self, state: vf.State) -> None:
         """Write trajectory artifacts and apply retention policy.
 
-        Runs *after* ``score_rollout``, so ``rollout.final_reward`` and
+        Runs *after* ``score_rollout``, so ``state["reward"]`` and
         ``state["metrics"]`` are already populated.
         """
         try:
             rollout = require_rollout(state)
         except RuntimeError:
             return
+
+        rollout.final_reward = state.get("reward")
 
         mgr = self.artifact_manager
         try:

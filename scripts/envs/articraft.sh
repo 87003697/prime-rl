@@ -24,7 +24,8 @@
 
 # --- 路径常量 ---
 # ARTICRAFT_DIR: articraft 源代码在容器内的位置（agent/、sdk/、scaffold.py 等）
-ARTICRAFT_DIR="/data/work/articraft"
+# Phase 2: shipped with prime-rl under environments/articraft/source/
+ARTICRAFT_DIR="${PROJECT_DIR}/environments/articraft/source"
 
 # ARTICRAFT_CODE_TAR: 代码 tar 包在 S3 FUSE 上的路径（~16MB，含 sdk/agent/cli 等，不含 data/records）
 ARTICRAFT_CODE_TAR="${S3_PREFIX}/data/articraft/articraft-code.tar"
@@ -36,27 +37,19 @@ ARTICRAFT_DATASET_TAR="${S3_PREFIX}/data/articraft/articraft-dataset-4-5star.tar
 ARTICRAFT_DATASET_LOCAL="/local-ssd/data/articraft"
 
 
-# --- 步骤 1: 解压 articraft 代码 ---
-# 从 S3 FUSE 读取 tar 包，解压 articraft 源代码到容器本地盘。
-# 为什么用 tar 而不是 aws s3 sync：articraft repo 去掉 data/records 后仍有 ~1400 文件，
-# aws s3 sync 逐文件下载需要数分钟；tar 是单次顺序读 16MB 大文件，秒级完成。
-# tar 包内容：sdk/、agent/、cli/、scaffold.py、pyproject.toml、data/categories/、
-#             data/system_prompts/、data/batch_specs/（不含 data/records、data/cache、viewer/web）。
-# 幂等：如果 sdk/ 目录已存在则跳过（pod 重启后重跑不会重复解压）。
+# --- 步骤 1: 验证 articraft 代码存在 ---
+# Phase 2 改动：articraft 源码子集（agent/、sdk/、data/categories/ 等 ~800 文件）
+#   已内嵌在 prime-rl 仓库 environments/articraft/source/ 目录下，
+#   通过 s5cmd sync prime-rl 代码时一并部署，不再需要从 S3 解压 tar 包。
+# 此函数仅做存在性验证：检查 agent/ 子目录是否存在，打印文件数。
+# ARTICRAFT_CODE_TAR 变量保留但不再使用（向后兼容，如果未来需要回退到 tar 模式）。
 setup_ac_sync_code() {
-    echo "  [env] Extracting articraft code from tar..."
-    if [ -d "${ARTICRAFT_DIR}/sdk" ]; then
-        echo "    Already present, skipping"
-        return
-    fi
-    if [ -f "${ARTICRAFT_CODE_TAR}" ]; then
-        mkdir -p "${ARTICRAFT_DIR}"
-        cat "${ARTICRAFT_CODE_TAR}" | tar xf - -C "${ARTICRAFT_DIR}/" --warning=no-unknown-keyword
-        echo "    Extracted to ${ARTICRAFT_DIR} ($(find ${ARTICRAFT_DIR} -type f | wc -l) files)"
-    else
-        echo "    ERROR: code tar not found at ${ARTICRAFT_CODE_TAR}"
+    echo "  [env] Articraft source is at ${ARTICRAFT_DIR} (shipped with prime-rl)"
+    if [ ! -d "${ARTICRAFT_DIR}/agent" ]; then
+        echo "    ERROR: ${ARTICRAFT_DIR}/agent not found."
         exit 1
     fi
+    echo "    OK ($(find ${ARTICRAFT_DIR} -type f | wc -l) files)"
 }
 
 

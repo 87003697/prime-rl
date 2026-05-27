@@ -1,7 +1,9 @@
 """Articraft RL environment runtime schema.
 
 All environment-owned state lives under ``state["rollout"]`` (a :class:`Rollout`).
-Freshness tracking replaces ``CompileFeedbackLoop`` with direct dataclass fields.
+
+Phase 2 refactoring: compile state extracted to :class:`CompileState`,
+compaction tracking to :class:`CompactionState`.
 """
 
 from __future__ import annotations
@@ -13,7 +15,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from agent.workspace_docs import VirtualWorkspace
 
-MUTATING_TOOL_NAMES = frozenset({"apply_patch", "replace", "write_file"})
+# 会修改 model.py 内容的工具名集合——用于 CompileState.mark_code_mutated() 触发
+# edit_revision 递增，从而使 code_is_fresh() 返回 False，强制下次 compile_model 重新编译。
+# "edit_lines" 是 v2 新增工具；在 v1 模式下不会被注册但存在于此集合中，零副作用
+# （与 "apply_patch" 同理——它在 RL 环境中也未注册）。
+MUTATING_TOOL_NAMES = frozenset({"apply_patch", "replace", "write_file", "edit_lines"})
 
 SCHEMA_VERSION = "articraft-trajectory-v1"
 
@@ -49,11 +55,94 @@ class TurnRecord:
 
 
 @dataclass
+class CompileState:
+    """Compile feedback loop state — mirrors harness_compile.py CompileFeedbackLoop.
+
+    Phase 1 fields were flat on Rollout; Phase 2 groups them here for clarity.
+    """
+
+    # Freshness tracking: edit_revision increments on write/replace,
+    # last_revision updates on successful compile. Equal ⇒ code is "fresh".
+    edit_revision: int = 0
+    last_revision: int = -1
+
+    # Compile result cache for freshness reuse / rubric scoring.
+    last_bundle_dict: dict[str, Any] | None = None
+    last_attempt_dict: dict[str, Any] | None = None
+
+    # Failure streak (Phase 2 Feature #1).
+    # Maps to CompileFeedbackLoop._last_compile_failure_sig / _consecutive_compile_failure_count.
+    last_failure_sig: str | None = None
+    consecutive_failure_count: int = 0
+
+    # Termination nudge: env injects <compile_required> when model stops
+    # without tool calls and code is stale. >3 nudges → force terminate.
+    nudge_count: int = 0
+
+    last_latency_ms: float | None = None
+
+    def code_is_fresh(self) -> bool:
+        return self.last_revision == self.edit_revision and self.last_revision >= 0
+
+    def mark_code_mutated(self, tool_name: str) -> None:
+        if tool_name not in MUTATING_TOOL_NAMES:
+            return
+        self.edit_revision += 1
+
+    def mark_attempt(self, bundle: Any) -> None:
+        self.last_attempt_dict = bundle.to_dict()
+
+    def mark_success(self, bundle: Any) -> None:
+        self.last_revision = self.edit_revision
+        self.last_bundle_dict = bundle.to_dict()
+        self.nudge_count = 0
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionConfig:
+    """Immutable compaction parameters — parsed from TOML ``[compaction]`` section.
+
+    hard_threshold: prompt token ceiling before unconditional compaction fires.
+      Derived as seq_len(16384) - system/tool_defs overhead (~2K) ≈ 14K.
+    full_turns_to_keep: recent turns preserved verbatim during compaction,
+      so the model always sees its latest compile errors + fix attempts.
+    """
+
+    hard_threshold: int = 14000
+    full_turns_to_keep: int = 4
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> CompactionConfig:
+        if not d:
+            return cls()
+        return cls(
+            hard_threshold=d.get("hard_threshold", cls.hard_threshold),
+            full_turns_to_keep=d.get("full_turns_to_keep", cls.full_turns_to_keep),
+        )
+
+
+@dataclass
+class CompactionState:
+    """Per-rollout compaction tracking for decide_compaction() parameters.
+
+    These fields feed the cooldown logic in decide_compaction():
+    - last_turn / last_prompt_tokens: "how many turns / tokens since last compaction?"
+    - last_failure_sig: avoids re-triggering compaction for the same unresolved error.
+    - count: observability only, does not affect decisions.
+    """
+
+    count: int = 0
+    last_turn: int | None = None
+    last_prompt_tokens: int | None = None  # post-compact value for growth_floor calc
+    last_failure_sig: str | None = None
+
+
+@dataclass
 class Rollout:
     """Mutable runtime model of one articraft RL rollout.
 
-    Freshness tracking (``edit_revision`` / ``last_compile_revision``) mirrors
-    ``CompileFeedbackLoop`` private attrs but as public, serializable fields.
+    Compile state → :attr:`compile` (:class:`CompileState`).
+    Compaction tracking → :attr:`compaction` (:class:`CompactionState`).
     """
 
     task: Task
@@ -63,49 +152,15 @@ class Rollout:
     script_path: Path
     virtual_workspace: VirtualWorkspace
 
-    # -- progress --
     turns: list[TurnRecord] = field(default_factory=list)
-
-    # -- evaluation --
     final_reward: float | None = None
-
-    # -- artifact metadata --
     metadata: dict[str, object] | None = None
 
-    # -- freshness state (replaces CompileFeedbackLoop internals) --
-    edit_revision: int = 0
-    last_compile_revision: int = -1
-    last_compile_bundle_dict: dict[str, Any] | None = None
-    last_compile_attempt_dict: dict[str, Any] | None = None
+    compile: CompileState = field(default_factory=CompileState)
+    compaction: CompactionState = field(default_factory=CompactionState)
 
-    # -- termination control --
-    compile_required_count: int = 0
-
-    # -- observability --
-    last_compile_latency_ms: float | None = None
-
-    def code_is_fresh(self) -> bool:
-        """Source: harness_compile.py L85-89 latest_code_is_fresh()"""
-        return (
-            self.last_compile_revision == self.edit_revision
-            and self.last_compile_revision >= 0
-        )
-
-    def mark_code_mutated(self, tool_name: str) -> None:
-        """Source: harness_compile.py L91-94 + harness.py L864-865"""
-        if tool_name not in MUTATING_TOOL_NAMES:
-            return
-        self.edit_revision += 1
-
-    def mark_compile_attempt(self, bundle: Any) -> None:
-        """Store every compile attempt (success or failure) for reward."""
-        self.last_compile_attempt_dict = bundle.to_dict()
-
-    def mark_compile_success(self, bundle: Any) -> None:
-        """Source: harness_compile.py L191-192"""
-        self.last_compile_revision = self.edit_revision
-        self.last_compile_bundle_dict = bundle.to_dict()
-        self.compile_required_count = 0
+    # Phase 2 Feature #2: one-shot edit_retry guidance injection.
+    edit_retry_injected: bool = False
 
     @property
     def trajectory_short_id(self) -> str:

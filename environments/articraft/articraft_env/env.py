@@ -1,6 +1,6 @@
 """Articraft multi-turn RL environment for verifiers / prime-rl.
 
-Phase 1: in-process compile-only reward, no external services.
+Phase 2: in-process compile reward + context compaction + failure streak guidance.
 Tool dispatch reuses articraft's ToolRegistry / Invocation classes directly.
 """
 
@@ -14,23 +14,27 @@ from pathlib import Path
 from typing import Any
 
 import verifiers as vf
+from pydantic import ValidationError
 
 from agent.compiler import compile_urdf_report_maybe_timeout
 from agent.feedback import compile_signal_bundle_from_exception, render_compile_signals
 from agent.models import CompileSignalBundle
 from agent.tools.base import ToolResult
+from agent.tools.code_region import extract_editable_code
 from agent.tools.compile_model import CompileModelTool
 from agent.tools.edit_code import ReplaceTool
 from agent.tools.read_file import ReadFileTool
 from agent.tools.registry import ToolRegistry
 from agent.tools.write_code import WriteFileTool
-from agent.workspace_docs import load_sdk_docs_reference
+from agent.workspace_docs import load_sdk_docs_bundle
 
 from .artifact_manager import ArticraftArtifactManager, ArtifactPolicy
+from .compaction import compact_messages, decide_compaction, estimate_messages_tokens
 from .dataset import build_dataset
+from .guidance import compile_signal_signature, maybe_inject_edit_code_guidance, maybe_inject_edit_code_guidance_v2
 from .prompts import build_turn0_messages, load_scaffold_text, load_system_prompt
 from .rubric import ArticraftRubric
-from .schema import Rollout, Task, TurnRecord, require_rollout
+from .schema import CompactionConfig, Rollout, Task, TurnRecord, require_rollout
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +104,32 @@ def _tc_id(tc: Any) -> str:
     return getattr(tc, "id", "")
 
 
+_SLIM_PRELOAD_PATHS = ("docs/sdk/references/quickstart.md",)
+
+
+def _load_slim_sdk_docs(articraft_root: Path, *, sdk_package: str) -> str:
+    """Load SDK docs reference with only quickstart preloaded (~3.6K tokens).
+
+    Phase 2: reduces context pressure vs the full 3-doc bundle (~11.6K tokens).
+    Other docs remain accessible via read_file(path=...) at runtime.
+    """
+    bundle = load_sdk_docs_bundle(articraft_root, sdk_package=sdk_package)
+    parts = [
+        "\n\n# Workspace Documentation (read-only)\n",
+        "The virtual workspace exposes `model.py` as the editable artifact script and `docs/` "
+        "as read-only SDK guidance.\n",
+        "`docs/sdk/references/quickstart.md` is the preloaded SDK entrypoint and reference index.\n",
+        "Use `read_file(path=...)` with these virtual paths when you need exact text.\n",
+    ]
+    for virtual_path in _SLIM_PRELOAD_PATHS:
+        try:
+            text = bundle.read_text(virtual_path)
+            parts.append(f"\n## {virtual_path}\n````markdown\n{text}\n````\n")
+        except (KeyError, FileNotFoundError):
+            pass
+    return "".join(parts)
+
+
 class ArticraftEnv(vf.MultiTurnEnv):
     """Articraft placement environment over MultiTurnEnv.
 
@@ -121,6 +151,8 @@ class ArticraftEnv(vf.MultiTurnEnv):
         provider: str = "openrouter",
         reward_weights: dict[str, float] | None = None,
         max_rollouts_per_example: int = 0,
+        compaction: dict[str, Any] | None = None,
+        tools_version: str = "v1",
         **kwargs: Any,
     ) -> None:
         self.articraft_root = Path(articraft_root).expanduser().resolve()
@@ -133,20 +165,55 @@ class ArticraftEnv(vf.MultiTurnEnv):
         self.sdk_package = sdk_package
         self.provider = provider
 
+        self.compaction_config = CompactionConfig.from_dict(compaction)
+        self._tools_version = tools_version
+
         # -- articraft tool registry (reuses articraft Tool/Invocation classes) --
-        tools = [
-            ReadFileTool(editable_model_only=True),
-            ReplaceTool(),
-            WriteFileTool(),
-            CompileModelTool(),
-        ]
+        #
+        # tools_version 版本化设计：
+        #   "v1"（默认）: 原始 4 工具集 [read_file, replace, write_file, compile_model]
+        #                 代码路径与修改前逐字节一致，零风险
+        #   "v2":         增强 5 工具集 [read_file, replace(v2), write_file, compile_model, edit_lines]
+        #                 replace 替换为 ReplaceV2Tool（匹配失败时附 closest-match 提示）
+        #                 新增 EditLinesTool（按行号编辑，绕过精确文本匹配）
+        #
+        # 切换方式：TOML 配置 [orchestrator.train.env.args] tools_version = "v2"
+        # 回滚方式：删除该行或改为 "v1"，不需要改任何代码
+        #
+        # v2 的 import 放在分支内部（延迟导入），确保 v1 路径不触碰新代码
+        if tools_version == "v2":
+            from agent.tools.edit_lines import EditLinesTool
+            from agent.tools.replace_v2 import ReplaceV2Tool
+            tools = [
+                ReadFileTool(editable_model_only=True),
+                ReplaceV2Tool(),   # 工具名仍为 "replace"，schema 与 v1 一致
+                WriteFileTool(),
+                CompileModelTool(),
+                EditLinesTool(),   # v2 新增工具
+            ]
+        else:
+            tools = [
+                ReadFileTool(editable_model_only=True),
+                ReplaceTool(),
+                WriteFileTool(),
+                CompileModelTool(),
+            ]
         self.tool_registry = ToolRegistry(tools)
+
+        # guidance 函数映射：v2 的 guidance 额外提示 edit_lines 作为替代修复路径
+        # 通过 self._inject_edit_guidance 统一接口，env_response() 中无需 if/else
+        if self._tools_version == "v2":
+            self._inject_edit_guidance = maybe_inject_edit_code_guidance_v2
+        else:
+            self._inject_edit_guidance = maybe_inject_edit_code_guidance
         self._vf_tool_defs = _convert_schemas_to_vf_tools(
             self.tool_registry.get_tool_schemas()
         )
 
         # -- shared state (immutable across rollouts) --
-        self.sdk_docs_context: str = load_sdk_docs_reference(
+        # Phase 2: preload only quickstart (~3.6K tokens) instead of all 3 docs (~11.6K).
+        # Other docs (probe-tooling, testing) are accessible via read_file().
+        self.sdk_docs_context: str = _load_slim_sdk_docs(
             self.articraft_root, sdk_package=self.sdk_package,
         )
         self.system_prompt_text: str = load_system_prompt(
@@ -200,6 +267,50 @@ class ArticraftEnv(vf.MultiTurnEnv):
         )
 
     # ------------------------------------------------------------------- hooks
+
+    async def get_prompt_messages(self, state: vf.State) -> vf.Messages:
+        """Assemble prompt then apply compaction if context pressure is high.
+
+        Architecture: base class calls env_response() internally (which runs tool
+        dispatch). We run compaction *after* the base returns to avoid interfering
+        with that flow. The compacted prompt is stored in trajectory by verifiers
+        and automatically used as prev_prompt next turn — no snapshot needed.
+        """
+        full_prompt = await super().get_prompt_messages(state)
+
+        # Turn 0: no trajectory yet, nothing to compact
+        if not state.get("trajectory"):
+            return full_prompt
+
+        # About to terminate: skip compaction to avoid wasted computation
+        if state.get("final_env_response") is not None:
+            return full_prompt
+
+        rollout = require_rollout(state)
+        current_tokens = estimate_messages_tokens(full_prompt)
+        decision = decide_compaction(
+            prompt_tokens=current_tokens,
+            hard_threshold=self.compaction_config.hard_threshold,
+            consecutive_compile_failure_count=rollout.compile.consecutive_failure_count,
+            last_compile_failure_sig=rollout.compile.last_failure_sig,
+            last_soft_compaction_failure_sig=rollout.compaction.last_failure_sig,
+            compactable_item_count=max(0, len(rollout.turns) - self.compaction_config.full_turns_to_keep),
+            turn_number=len(rollout.turns),
+            last_soft_compaction_turn_number=rollout.compaction.last_turn,
+            last_soft_compaction_prompt_tokens=rollout.compaction.last_prompt_tokens,
+        )
+
+        if decision.trigger:
+            full_prompt = compact_messages(
+                full_prompt, rollout.turns, self.compaction_config.full_turns_to_keep,
+            )
+            rollout.compaction.count += 1
+            rollout.compaction.last_turn = len(rollout.turns)
+            # Store post-compact token count so cooldown growth_floor calculation is accurate
+            rollout.compaction.last_prompt_tokens = estimate_messages_tokens(full_prompt)
+            rollout.compaction.last_failure_sig = rollout.compile.last_failure_sig
+
+        return full_prompt
 
     async def setup_state(self, state: vf.State) -> vf.State:
         info = state.get("info") or {}
@@ -278,11 +389,11 @@ class ArticraftEnv(vf.MultiTurnEnv):
 
         # -- no tool calls: freshness-based termination --
         if not tool_calls:
-            if rollout.code_is_fresh():
+            if rollout.compile.code_is_fresh():
                 state["final_env_response"] = []
                 return []
-            rollout.compile_required_count += 1
-            if rollout.compile_required_count > 3:
+            rollout.compile.nudge_count += 1
+            if rollout.compile.nudge_count > 3:
                 state["final_env_response"] = []
                 return []
             return [
@@ -323,7 +434,23 @@ class ArticraftEnv(vf.MultiTurnEnv):
             )
 
             if result.is_success():
-                rollout.mark_code_mutated(tc_name)
+                rollout.compile.mark_code_mutated(tc_name)
+
+        # -- Phase 2 Feature #2: edit_retry guidance injection --
+        # Mirrors harness_guidance.py GuidanceInjector.maybe_inject_edit_code_guidance().
+        # One-shot per rollout: after the first replace "Could not find old_string" error,
+        # inject a user message telling the model to read_file first then retry.
+        # Uses user role for TITO compatibility (completion_mask=False, no gradient).
+        for tc, result in zip(tool_calls, tool_results):
+            guidance_msg = self._inject_edit_guidance(
+                tool_name=_tc_name(tc),
+                tool_error=result.error,
+                already_injected=rollout.edit_retry_injected,
+            )
+            if guidance_msg:
+                rollout.edit_retry_injected = True
+                result_messages.append(guidance_msg)
+                break
 
         # -- turn record --
         has_compile = "compile_model" in tc_names
@@ -331,8 +458,8 @@ class ArticraftEnv(vf.MultiTurnEnv):
             turn=len(rollout.turns),
             tool_calls=[{"name": n} for n in tc_names],
             compile_attempted=has_compile,
-            compile_success=rollout.code_is_fresh() if has_compile else None,
-            compile_signals=rollout.last_compile_attempt_dict,
+            compile_success=rollout.compile.code_is_fresh() if has_compile else None,
+            compile_signals=rollout.compile.last_attempt_dict,
         )
         rollout.turns.append(turn)
 
@@ -356,8 +483,6 @@ class ArticraftEnv(vf.MultiTurnEnv):
 
         # -- replace: empty old_string interception --
         if name == "replace":
-            from agent.tools.code_region import extract_editable_code
-
             try:
                 editable = extract_editable_code(
                     rollout.script_path.read_text("utf-8")
@@ -406,8 +531,6 @@ class ArticraftEnv(vf.MultiTurnEnv):
             return result
 
         except Exception as exc:
-            from pydantic import ValidationError
-
             if isinstance(exc, ValidationError):
                 errors = exc.errors()
                 missing = [
@@ -432,14 +555,21 @@ class ArticraftEnv(vf.MultiTurnEnv):
     # --------------------------------------------------------- compile
 
     async def _dispatch_compile(self, rollout: Rollout) -> ToolResult:
-        """In-process compile with freshness cache.
+        """In-process compile with freshness cache + failure streak tracking.
 
-        Mirrors harness_compile.py execute_compile_model() without
-        CompileFeedbackLoop — uses Rollout fields directly.
+        Mirrors harness_compile.py execute_compile_model() + _render_compile_tool_output().
+
+        Phase 2 additions (Feature #1 — failure streak):
+        - SHA-1 signature of each failure bundle detects repeated identical errors.
+        - render_compile_signals() appends "This failure matches..." / "failure N in a row"
+          when repeated=True / failure_streak >= 3.
+        - Cached compile path does NOT pass repeated/failure_streak: repeating compile_model
+          without code changes is not a failure streak.
         """
-        # freshness cache
-        if rollout.code_is_fresh() and rollout.last_compile_bundle_dict is not None:
-            bundle = CompileSignalBundle.from_dict(rollout.last_compile_bundle_dict)
+        # Freshness cache: model called compile without changing code → return cached result.
+        # Does NOT track failure streak (model didn't produce a new attempt).
+        if rollout.compile.code_is_fresh() and rollout.compile.last_bundle_dict is not None:
+            bundle = CompileSignalBundle.from_dict(rollout.compile.last_bundle_dict)
             cached_text = (
                 "Fresh compile already exists for the current code revision; "
                 "`compile_model` was not re-run.\n"
@@ -456,11 +586,35 @@ class ArticraftEnv(vf.MultiTurnEnv):
                 script_path=rollout.script_path,
                 sdk_package=self.sdk_package,
             )
-            rollout.last_compile_latency_ms = (time.monotonic() - t0) * 1000
+            rollout.compile.last_latency_ms = (time.monotonic() - t0) * 1000
             bundle = report.signal_bundle
-            content = render_compile_signals(bundle)
-            rollout.mark_compile_attempt(bundle)
-            rollout.mark_compile_success(bundle)
+
+            # Feature #1: failure streak — mirrors _render_compile_tool_output() logic.
+            # If the bundle has failures, hash it and compare with last sig:
+            #   same sig → model didn't fix the issue (repeated=True)
+            #   different sig → new error (count resets to 1 implicitly via +=1 from 0)
+            # If no failures → model fixed it, reset streak entirely.
+            failures = [s for s in bundle.signals if s.severity == "failure"]
+            if failures:
+                sig = compile_signal_signature(bundle.to_dict())
+                repeated = sig == rollout.compile.last_failure_sig
+                rollout.compile.last_failure_sig = sig
+                rollout.compile.consecutive_failure_count += 1
+            else:
+                repeated = False
+                rollout.compile.last_failure_sig = None
+                rollout.compile.consecutive_failure_count = 0
+
+            content = render_compile_signals(
+                bundle, repeated=repeated,
+                failure_streak=rollout.compile.consecutive_failure_count,
+            )
+            rollout.compile.mark_attempt(bundle)
+            # Only mark freshness-success when there are no failures. With failures,
+            # code_is_fresh() stays False so the next compile call runs fresh (needed
+            # for accurate streak tracking rather than returning cached result).
+            if not failures:
+                rollout.compile.mark_success(bundle)
 
             if report.urdf_xml:
                 urdf_path = self.artifact_manager.checkpoint_urdf_path(rollout.work_dir)
@@ -469,10 +623,22 @@ class ArticraftEnv(vf.MultiTurnEnv):
             return ToolResult(output=content)
 
         except Exception as exc:
-            rollout.last_compile_latency_ms = (time.monotonic() - t0) * 1000
+            rollout.compile.last_latency_ms = (time.monotonic() - t0) * 1000
+            # compile_signal_bundle_from_exception produces a severity="failure" signal,
+            # so the except path always counts as a failure for streak tracking.
             bundle = compile_signal_bundle_from_exception(exc)
-            content = render_compile_signals(bundle)
-            rollout.mark_compile_attempt(bundle)
+
+            # Feature #1: failure streak — same logic as try path
+            sig = compile_signal_signature(bundle.to_dict())
+            repeated = sig == rollout.compile.last_failure_sig
+            rollout.compile.last_failure_sig = sig
+            rollout.compile.consecutive_failure_count += 1
+
+            content = render_compile_signals(
+                bundle, repeated=repeated,
+                failure_streak=rollout.compile.consecutive_failure_count,
+            )
+            rollout.compile.mark_attempt(bundle)
             return ToolResult(output=content, error=str(exc))
 
 

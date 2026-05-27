@@ -73,46 +73,46 @@ class TestRollout:
 
     def test_freshness_initial(self, tmp_path: Path):
         r = self._make_rollout(tmp_path)
-        assert not r.code_is_fresh()
+        assert not r.compile.code_is_fresh()
 
     def test_freshness_after_write_and_compile(self, tmp_path: Path):
         r = self._make_rollout(tmp_path)
-        r.mark_code_mutated("write_file")
-        assert r.edit_revision == 1
-        assert not r.code_is_fresh()
+        r.compile.mark_code_mutated("write_file")
+        assert r.compile.edit_revision == 1
+        assert not r.compile.code_is_fresh()
 
         @dataclass
         class FakeBundle:
             def to_dict(self) -> dict:
                 return {"status": "success", "summary": "", "signals": []}
 
-        r.mark_compile_attempt(FakeBundle())
-        r.mark_compile_success(FakeBundle())
-        assert r.code_is_fresh()
-        assert r.last_compile_revision == 1
-        assert r.compile_required_count == 0
+        r.compile.mark_attempt(FakeBundle())
+        r.compile.mark_success(FakeBundle())
+        assert r.compile.code_is_fresh()
+        assert r.compile.last_revision == 1
+        assert r.compile.nudge_count == 0
 
     def test_freshness_non_mutating_tool(self, tmp_path: Path):
         r = self._make_rollout(tmp_path)
-        r.mark_code_mutated("read_file")
-        assert r.edit_revision == 0
+        r.compile.mark_code_mutated("read_file")
+        assert r.compile.edit_revision == 0
 
     def test_freshness_after_second_mutation(self, tmp_path: Path):
         r = self._make_rollout(tmp_path)
-        r.mark_code_mutated("write_file")
+        r.compile.mark_code_mutated("write_file")
 
         @dataclass
         class FakeBundle:
             def to_dict(self) -> dict:
                 return {"status": "success", "summary": "", "signals": []}
 
-        r.mark_compile_attempt(FakeBundle())
-        r.mark_compile_success(FakeBundle())
-        assert r.code_is_fresh()
+        r.compile.mark_attempt(FakeBundle())
+        r.compile.mark_success(FakeBundle())
+        assert r.compile.code_is_fresh()
 
-        r.mark_code_mutated("replace")
-        assert r.edit_revision == 2
-        assert not r.code_is_fresh()
+        r.compile.mark_code_mutated("replace")
+        assert r.compile.edit_revision == 2
+        assert not r.compile.code_is_fresh()
 
     def test_trajectory_short_id(self, tmp_path: Path):
         r = self._make_rollout(tmp_path)

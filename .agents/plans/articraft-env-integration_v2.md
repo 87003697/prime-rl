@@ -61,6 +61,17 @@ graph TB
 
 ## Phase 1: Core In-Process RL Pipeline
 
+> **✅ Phase 1 已完成 (2026-05-25)**
+> 
+> 全链路验证通过：KAOLA 8-GPU 训练成功启动，Step 0 完成（reward=0.15 train / 0.31 eval），
+> 模型能成功 compile 并通过 QC 检查（最高 reward=0.937）。
+> 
+> **主要发现**：rollout 平均 64K tokens（prompt 16K + completion 48K），远超 seq_len=32768，
+> 且 OOM at 32K。根本原因是 prompt 中 SDK docs 占 11.6K + tool responses 累积过长。
+> 需要 Phase 2 Feature #6 (Context Window Management) 解决。
+> 
+> 详见 `.agents/session/2026-05-25-articraft-kaola-full-debug.md`。
+
 ### 1.1 目标与验证标准
 
 **目标**: 实现最小可用的 `ArticraftEnv`，全 in-process（无外部服务），reward 纯基于 compiler QC signals。
@@ -596,6 +607,17 @@ RL 版不使用 `CompileFeedbackLoop` 类（原因见 1.3 State 设计方案）�
 ---
 
 ## Phase 2: Enhanced Feedback & Advanced Tools
+
+> **⬅️ 当前阶段：优先实现 Feature #6 (Context Window Management)**
+> 
+> Phase 1 训练暴露的核心问题是 token 预算溢出（avg 64K tokens/rollout vs seq_len 32K），
+> 不是 reward signal 不足。Feature #6 是解除 OOM 的前置条件，应优先于其他 feature。
+> 
+> 具体数据：
+> - Prompt 固定开销 16K（SDK docs 11.6K + system 3.6K）→ 考虑压缩/截断 SDK docs
+> - Tool response 累积 ~24K（50 turns × 480 avg）→ 考虑只保留最近 N 条完整 + 旧的摘要
+> - 模型输出很节约（avg 60 tokens/turn）→ 不是瓶颈
+> - 另需减少 max_turns（50→15-20）减少无效探索
 
 ### 2.1 目标与触发条件
 

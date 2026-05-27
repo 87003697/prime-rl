@@ -128,7 +128,7 @@ class ArticraftArtifactManager:
                 "compile_attempted": any(
                     t.compile_attempted for t in rollout.turns
                 ),
-                "code_is_fresh": rollout.code_is_fresh(),
+                "code_is_fresh": rollout.compile.code_is_fresh(),
             }
             if metrics:
                 meta["metrics"] = metrics
@@ -170,7 +170,7 @@ class ArticraftArtifactManager:
         work_dir = rollout.work_dir
         if not work_dir.is_dir():
             return
-        if self.policy.keep_failed_only and rollout.code_is_fresh():
+        if self.policy.keep_failed_only and rollout.compile.code_is_fresh():
             shutil.rmtree(work_dir, ignore_errors=True)
 
     def prune_old_rollouts(self, rollout: Rollout) -> None:

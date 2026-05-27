@@ -1,19 +1,19 @@
 # Articraft RL training config — KAOLA platform.
 #
-# Phase 1: in-process compile-only reward, Qwen3.5-9B, dp=6 + train=2.
-# All training outputs write to /local-ssd/ (fast NVMe), background rsync to S3.
+# Phase 2: compile reward + context compaction + failure streak guidance.
+# Qwen3.5-9B, dp=6 + train=2. Outputs → /local-ssd/ (NVMe), rsync to S3.
 #
 # Key differences from BlenderGym:
 #   - No external render/score services (compile is in-process)
 #   - tool_call_parser for native tool calling (not XML parser)
-#   - Higher max_turns (50 vs 3) and seq_len (32768 vs 16384)
+#   - Higher max_turns (50 vs 3), seq_len=16384 (with compaction at 14K)
 #   - URDF_COMPILE_TIMEOUT_SECONDS=30 set in articraft.sh
 #
 # Setup: . scripts/setup_kaola.sh  (must use source, not bash)
 # Train: uv run rl @ configs/articraft/rl_articraft_kaola.toml
 
 output_dir = "/local-ssd/prime-rl-output"
-seq_len = 32768
+seq_len = 16384
 max_steps = 20000
 
 [deployment]
@@ -58,6 +58,11 @@ num_workers = 6
 max_total_completion_tokens = 24576
 
 [orchestrator.train.env.args]
+# tools_version: 工具集版本，控制 RL 环境中注册哪些工具 + guidance 行为
+#   "v1"（默认）: 原始 4 工具 [read_file, replace, write_file, compile_model]
+#   "v2": 增强 5 工具 [read_file, replace(closest-match提示), write_file, compile_model, edit_lines]
+#   回滚：删除此行或改为 "v1" 即可恢复原始行为，无需改代码
+tools_version = "v2"
 articraft_root = "/data/work/articraft"
 max_turns = 50
 work_root = "/local-ssd/prime-rl-output/articraft-work"
@@ -68,6 +73,10 @@ eval_split = "eval"
 eval_holdout = 50
 sdk_package = "sdk"
 provider = "openrouter"
+
+[orchestrator.train.env.args.compaction]
+hard_threshold = 14000
+full_turns_to_keep = 4
 
 [orchestrator.train.env.args.reward_weights]
 check_fraction = 0.7
