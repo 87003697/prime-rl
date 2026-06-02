@@ -130,6 +130,28 @@ setup_python_deps() {
     uv sync --frozen --extra flash-attn
 }
 
+# 启动后台 watchdog：每 30s 采样 cgroup memory 和 vLLM /liveness 端点。
+# 这两个 log 由 EXIT trap 一同 sync 到 S3，下次 11h kill 至少留下内核侧痕迹
+# 用于诊断（cgroup OOM 趋势 / vLLM hung 时刻）。
+setup_watchdog() {
+    local _mem_log="${OUTPUT_LOCAL}/logs/cgroup_mem.log"
+    local _liveness_log="${OUTPUT_LOCAL}/logs/liveness.log"
+    mkdir -p "$(dirname "${_mem_log}")"
+    (while true; do
+        local _ts="[$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
+        if [ -r /sys/fs/cgroup/memory.current ]; then
+            echo "${_ts} mem=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo NA)" >> "${_mem_log}"
+        fi
+        # vLLM /liveness 端点（上游 a87badd6 引入），200 = healthy
+        local _code
+        _code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://localhost:8000/liveness 2>/dev/null || echo "ERR")
+        echo "${_ts} liveness=${_code}" >> "${_liveness_log}"
+        sleep 30
+    done) &
+    WATCHDOG_PID=$!
+    echo "    Watchdog PID: ${WATCHDOG_PID} (cgroup mem + vLLM liveness, every 30s)"
+}
+
 # 启动后台进程，每 5 分钟将本地 SSD 上的训练产出同步到 S3（持久化）。
 # shell EXIT 时触发最终同步，确保训练结束后不丢数据。
 setup_s3_sync() {
@@ -138,6 +160,7 @@ setup_s3_sync() {
         return
     fi
     echo "  Starting background S3 sync..."
+    setup_watchdog
     sync_all() {
         local _sync_log="${OUTPUT_LOCAL}/logs/s3_sync.log"
         mkdir -p "$(dirname "${_sync_log}")"
@@ -160,7 +183,7 @@ setup_s3_sync() {
     echo "    PID: ${SYNC_PID} (every 5 min, via S3 API)"
     echo "    ${CKPT_LOCAL} -> ${CKPT_S3_BUCKET} (--delete)"
     echo "    ${OUTPUT_LOCAL} -> ${OUTPUT_S3_BUCKET} (excl broadcasts/*.bin)"
-    trap "kill ${SYNC_PID} 2>/dev/null || true; [ -n \"\${OPTIX_PID:-}\" ] && kill \"\${OPTIX_PID}\" 2>/dev/null || true; type _blendergym_cleanup &>/dev/null && _blendergym_cleanup; sync_all" EXIT
+    trap "kill ${SYNC_PID} 2>/dev/null || true; [ -n \"\${WATCHDOG_PID:-}\" ] && kill \"\${WATCHDOG_PID}\" 2>/dev/null || true; [ -n \"\${OPTIX_PID:-}\" ] && kill \"\${OPTIX_PID}\" 2>/dev/null || true; type _blendergym_cleanup &>/dev/null && _blendergym_cleanup; sync_all" EXIT
 }
 
 # ============================================================================

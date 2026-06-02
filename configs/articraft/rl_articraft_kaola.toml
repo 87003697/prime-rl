@@ -22,7 +22,8 @@ num_infer_gpus = 6
 num_train_gpus = 2
 
 [ckpt]
-interval = 25
+# v3 sync (2026-06-02): interval 25→10 to bound work-loss window (v2 lost 6 steps after 11h kill at interval=25).
+interval = 10
 keep_last = 2
 output_dir = "/local-ssd/checkpoints/articraft-9b-dp6"
 
