@@ -63,7 +63,7 @@ max_total_completion_tokens = 24576
 #   "v2": 增强 5 工具 [read_file, replace(closest-match提示), write_file, compile_model, edit_lines]
 #   回滚：删除此行或改为 "v1" 即可恢复原始行为，无需改代码
 tools_version = "v2"
-articraft_root = "/data/work/articraft"
+articraft_root = "/data/work/prime-rl/environments/articraft/source"
 max_turns = 50
 work_root = "/local-ssd/prime-rl-output/articraft-work"
 keep_failed_only = true
@@ -91,7 +91,7 @@ num_examples = 10
 rollouts_per_example = 1
 
 [orchestrator.eval.env.args]
-articraft_root = "/data/work/articraft"
+articraft_root = "/data/work/prime-rl/environments/articraft/source"
 max_turns = 50
 work_root = "/local-ssd/prime-rl-output/articraft-work"
 keep_failed_only = false

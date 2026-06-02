@@ -50,9 +50,29 @@ fi
 # --- 路径配置 ---
 if [ -z "${EXP_NAME:-}" ]; then
     echo "ERROR: EXP_NAME not set. Export it before running setup."
-    echo "  e.g.: export EXP_NAME=blendergym-9b-dp6"
+    echo "  e.g.: export EXP_NAME=articraft-0527-phase2-compaction"
     exit 1
 fi
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ EXP_NAME 命名规范：{project}-{MMDD}-{description}                       │
+# │                                                                         │
+# │ 格式：                                                                   │
+# │   {project}     — articraft / blendergym / ...                          │
+# │   {MMDD}        — 提交日期（月日，4位）                                    │
+# │   {description} — 2-3 个词描述本次实验重点                                 │
+# │                                                                         │
+# │ 示例：                                                                   │
+# │   articraft-0525-phase1          Phase 1 baseline                       │
+# │   articraft-0527-phase2-compaction  Phase 2 + context compaction        │
+# │   articraft-0529-phase2-v2tools  Phase 2 + v2 tool set                  │
+# │   blendergym-0513-9b-dp6        BlenderGym 9B dp6 训练                  │
+# │                                                                         │
+# │ 规则：                                                                   │
+# │   - 全小写 + 连字符分隔                                                   │
+# │   - 不含模型名（配置里已有）                                               │
+# │   - 相同实验重跑用日期区分，不加 _2 后缀                                    │
+# │   - S3 路径：experiments/{EXP_NAME}/output/                             │
+# └─────────────────────────────────────────────────────────────────────────┘
 
 HF_MODEL="${HF_MODEL:-Qwen/Qwen3.5-9B}"
 HF_MODEL_SHORT=$(echo "${HF_MODEL}" | awk -F'/' '{print $NF}' | tr '[:upper:]' '[:lower:]')
