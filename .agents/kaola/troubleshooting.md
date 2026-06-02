@@ -4,6 +4,197 @@
 
 ---
 
+## 2026-06-02 — `uv run` 隐式重解析复活 color-codeword 冲突（即使 `uv sync --frozen` 成功）
+
+### 现象
+
+V3 训练 r2 (`ericzyma-art-0602-v3-r2-normal-20260602-192629`) 提交后所有 setup 步骤都打印成功，最后两行：
+
+```
+=== Setup complete ===
+=== Ready to train. ===
+```
+
+紧接着 `uv run rl @ configs/articraft/rl_articraft_kaola.toml` 在毫秒级崩溃，stderr 抛出与 v2 sync 时一模一样的 resolver 报错：
+
+```
+× No solution found when resolving dependencies for split (markers:
+  python_full_version == '3.12.*' and platform_machine == 'x86_64'):
+  ╰─▶ Because prime-rl[envs] depends on color-codeword and
+      color-codeword==0.1.0 depends on verifiers>=0.1.15.dev17 ...
+```
+
+`koala get` 显示 Master failed=1，TTL=3600s 把 pod 一并清掉，重 submit 时观察才能复现到全部日志。
+
+### 根因
+
+`setup_python_deps` 用了 `uv sync --frozen`（commit 56c58d41），但训练命令是裸的 `uv run rl @ ...`。**`uv run` 默认在每次启动前做隐式 `uv sync`**（lock-vs-pyproject 一致性校验 → 重解析），与 7 天 `exclude-newer` 窗口下 PyPI 元数据漂移仍然撞同一个 color-codeword / verifiers 矛盾。`verify_imports()` 里的 `uv run python -c` 也走同一条路径，但 `set -e` 没拦下（看上去是 uv 的失败退出码在 source 子函数里被吞掉了）。
+
+下游所有形态的 uv 入口都会撞：
+
+| 入口 | 是否触发隐式 re-resolve |
+|---|---|
+| `uv sync --frozen` | ❌ 不触发 |
+| `uv sync --locked` | ✅ 触发 |
+| `uv sync`（默认） | ✅ 触发 |
+| `uv run <cmd>` | ✅ 触发 |
+| `uv pip install ...` | ✅ 触发（在 workspace cwd 下）|
+| `${UV_PROJECT_ENVIRONMENT}/bin/python -c "..."` | ❌ 不触发（绕过 uv 入口）|
+
+### 解决
+
+`setup_kaola.sh` 顶部 export 全局开关：
+
+```bash
+# UV_FROZEN=1: 让所有 uv run / uv sync / uv pip 都信任 lockfile，禁用隐式重解析。
+# 不止 `uv sync --frozen` 这一处，训练命令本身、verify_imports 子调用、env 安装、
+# 任何其他 subprocess 里的 uv 入口全部受影响。
+export UV_FROZEN=1
+```
+
+这是 `--frozen` 标志的 env-var 等价物，`uv ≥ 0.4` 起官方支持。**不需要**再给每个 `uv run` 单独加 `--frozen`。
+
+V3 训练 r4 (`ericzyma-art-0602-v3-r4-normal-20260602-194148`) 携带此修复后第一次进入 `Starting training loop (max_steps=20000)`。
+
+### 教训
+
+- 容器内长跑场景**永远 `UV_FROZEN=1`**，不要相信单点 `--frozen` 能覆盖整个生命周期
+- "setup 全部打印 OK，紧接着训练命令毫秒级崩"= 几乎肯定是 `uv run` 隐式 re-resolve（不是 GPU 调度、不是 model 加载，那些会先打印更多日志）
+- 上一条目（`uv sync --locked` 失败）的 commit 56c58d41 修了 setup 那一处，但不彻底；本次 17a77be1 才是完整修复
+- 提示词触发：看到 `setup complete` 后秒崩 + stderr 含 "No solution found ... color-codeword"，直接 `export UV_FROZEN=1` 重提，不要再翻 lockfile
+
+### 相关
+
+- 上方 `2026-06-02 — uv sync --locked 在 verifiers/color-codeword 上 re-lock 失败` 条目（前置背景）
+- commit `17a77be1` (`fix(setup): export UV_FROZEN=1 to block implicit re-resolve`)
+
+---
+
+## 2026-06-02 — `koala delete --force` 误黑应用层失败的健康节点
+
+### 现象
+
+V3 训练 r2 在 `uv run rl` 阶段崩溃（应用层 bug，节点本身完全正常）。为了快速重提，跑了：
+
+```bash
+yes | koala delete --force ericzyma-art-0602-v3-r2-normal-20260602-192629
+```
+
+CLI 顺手把承载 r2 的 hyperpod 节点写入 `~/.cache/koala-cli/bad_nodes.json`，12h 内自动避开。**这次本来是健康节点**，被误黑后接下来 12h 候选池减少 1。后续 r4 能跑起来确实是因为剩余节点中正好抽到没问题的，但纯靠运气。
+
+### 根因
+
+`koala delete --force` 的语义是"强制删除卡死任务并把节点拉黑"。它无法区分：
+
+| 失败类型 | 节点该不该黑 |
+|---|---|
+| Pod stuck Updating / Init 5+ min（mountpoint-s3 / SSH init 故障）| ✅ 黑掉，节点本身坏了 |
+| Pod 进入 Running，setup 跑完，应用层 crash | ❌ 不应该黑，节点没问题 |
+| Pod 进入 Running，long-run 后 SIGKILL | ⚠️ 视情况，无法判定时建议不黑 |
+
+CLI 当前是无条件黑。
+
+### 解决
+
+按失败类型选不同删除路径：
+
+```bash
+# 节点级故障（Updating / PodInitializing 卡死 5+ min）→ --force 让节点入黑名单
+yes | koala delete --force <task>
+
+# 应用层故障（任务已 Running 过、setup 跑完、用户代码崩溃）→ 不带 --force
+koala delete <task>
+# 仅删 PyTorchJob，节点保留在候选池
+```
+
+在脚本里判断更可靠的方法：
+
+```bash
+status=$(koala get <task> 2>&1 | awk -F': +' '/^状态:/ {print $2}')
+running_at=$(koala get <task> 2>&1 | awk '/Running: True/ {print $0; found=1} END {exit !found}')
+if [ "$status" = "Failed" ] && [ -n "$running_at" ]; then
+    # 进入过 Running → 应用层失败 → 不黑节点
+    koala delete <task>
+else
+    # 没进入 Running → 节点级故障 → 黑节点
+    yes | koala delete --force <task>
+fi
+```
+
+### 教训
+
+- `--force` 不是"更稳的删除"，是"加上拉黑节点的副作用"
+- V3 这一轮 r1 用 `--force` 后跑出 8 小时坏节点 quarantine，r3 又用 `--force` 又拉黑了 11 小时，总共 3 个节点被锁，运气好剩下还能调度上来；如果集群再忙一些就要手动 `koala nodes unblock` 才能恢复
+- 看到任务失败先 `koala get` 看 `Running: True/False` 时序，**进入过 Running 的失败基本都是应用层**，用普通 `koala delete`
+
+### 相关
+
+- 上方 `2026-06-02 — koala submit 短时间多发节点存储故障` 条目（合理使用 `--force` 的场景）
+- 共享 `codes/.agents/koala/workflow.md` § "故障节点黑名单"（待补充本经验）
+
+---
+
+## 2026-06-02 — `koala submit` 没有 `-e` 注入 secret，必须 inline export
+
+### 现象
+
+在 v2sync2 / v3 r1 提交时尝试：
+
+```bash
+koala submit -m normal -g 8 -j art-0602-v3-r1 \
+  --code "$S3:/data/work/prime-rl" \
+  -e EXP_NAME="$EXP_NAME" \
+  -e HF_TOKEN="$HF_TOKEN" \
+  -e WANDB_API_KEY="$WANDB_API_KEY" \
+  -c "..."
+```
+
+报：
+
+```
+koala: error: unrecognized arguments: -e EXP_NAME=articraft-0602-phase2-v3sync \
+       -e HF_TOKEN=hf_xxxxxx -e WANDB_API_KEY=cd27xxxxxx
+```
+
+⚠️ **secret 在 stderr 里以明文回显**——必须立刻去 HF / WandB 重置 token。
+
+### 根因
+
+`koala submit --help` 不存在 `-e/--env` 参数。CLI 文档（`doc/koala+使用指南.doc`）也没列环境变量注入字段。argparse 把所有未知 flag 当 positional arg 全部回显。
+
+### 解决
+
+只能通过 `-c` 命令字符串内嵌 export：
+
+```bash
+koala submit -m normal -g 8 -j art-0602-v3-r4 \
+  --code "$S3:/data/work/prime-rl" \
+  -y \
+  -c "export EXP_NAME=$EXP_NAME HF_TOKEN=\"$HF_TOKEN\" WANDB_API_KEY=\"$WANDB_API_KEY\" && \
+      cd /data/work/prime-rl && \
+      . scripts/setup_kaola.sh --env articraft && \
+      uv run rl @ configs/articraft/rl_articraft_kaola.toml"
+```
+
+注意：
+
+- `$HF_TOKEN` 等用**双引号**确保**本地 shell** 提交前展开（pod 里没有这些变量；详见 KOALA.md gotcha 表）
+- 提交前命令本身会被 `koala submit` 在 stdout 显示一次（含 token）；CI / agent 自动化场景考虑用 `koala submit ... > /dev/null 2>&1` 抑制
+- 一旦写错被 argparse 拒绝，token 一定明文回显——**重置一次 token 比省 5 秒打字重要**
+
+### 教训
+
+- 不存在 `-e` flag 是 koala v1.x 的事实；不要照搬 docker / kubectl 经验
+- secret 通过 stdin 文件 / k8s secret manager 注入是更安全的长期方案，但当前 CLI 不支持
+- argparse `unrecognized arguments` 错误在 secret 场景**永远会泄漏**——慎用 `unknown_args` 推测式调用，每次先 `koala submit --help` 核对
+
+### 相关
+
+- 共享 `codes/.agents/koala/workflow.md` § "提交命令" 已有 `-c "export ..."` 模板，但没强调"`-e` 不存在 + token 泄漏"风险，需要补一条
+- 共享 `codes/.agents/KOALA.md` § "提交命令 Checklist" 提到了双引号要求，可加一行 "`koala submit` 没有 `-e` flag"
+
+---
+
 ## 2026-06-02 — V2 训练 11 小时后被外部 SIGKILL（cleanPodPolicy + TTL 默认值）
 
 ### 现象

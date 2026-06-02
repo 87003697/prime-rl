@@ -311,3 +311,6 @@ signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 | Render 请求超时（`httpx.ReadTimeout`） | Blender 渲染卡死或 OPTIX 首次编译 | 检查 OPTIX cache（`/root/.nv/ComputeCache`）是否存在 |
 | Score 请求返回 500 | CLIP 模型加载失败或 GPU OOM | 查 `score_diag.log`；`nvidia-smi` 检查显存 |
 | 训练突然停且 pod 已被清理（无现场） | K8s 层 GC：`cleanPodPolicy: All` + `ttlSecondsAfterFinished` 默认 1h | 提交 spec 改 `OnSuccess` + TTL ≥ 86400s；详见 `troubleshooting.md` 2026-06-02 V2 训练 11h SIGKILL 条目 |
+| `=== Setup complete ===` 后 `uv run rl` 毫秒级崩，stderr 含 `No solution found ... color-codeword` | `uv run` 隐式 re-resolve 撞 7 天 exclude-newer 元数据漂移 | `setup_kaola.sh` 顶部 `export UV_FROZEN=1`，覆盖所有 uv 入口；详见 `troubleshooting.md` 2026-06-02 `uv run` 隐式重解析条目 |
+| `koala submit -e ENV=val` 报 `unrecognized arguments` 并把 token 明文回显 | koala submit 没有 `-e` flag | 立刻轮换泄漏的 token；改用 `-c "export ENV=$ENV && ..."` 内嵌注入 |
+| Pod 进入 Running 后应用层崩，被 `koala delete --force` 删除 | `--force` 自动黑掉承载节点 | 应用层失败用普通 `koala delete`（不带 `--force`）保留节点；只对 `Updating` / `Init` 卡死 5+ min 用 `--force` |
