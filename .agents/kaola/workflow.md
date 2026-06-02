@@ -47,7 +47,15 @@ uv run rl @ configs/multimodal/rl_blendergym_kaola.toml
 如果修改了 `pyproject.toml` 或 `uv.lock`，需要重跑：
 
 ```bash
-uv sync --locked --extra flash-attn
+# v2 同步后用 --frozen（不是 --locked）：lockfile 里 verifiers/color-codeword
+# 等带 git pin + exclude-newer 的依赖会触发 re-resolve 失败。--frozen 直接信任
+# lockfile 不重新解析，相同 wheel hash 安装产物完全等价。详见 troubleshooting
+# 2026-06-02 — uv sync --locked 在 verifiers/color-codeword 上失败。
+#
+# 另：必须在 workspace root（/data/work/prime-rl）执行，否则 uv 按 cwd 解析
+# 项目配置可能触发二次 re-lock。subprocess 内调用 python 时建议直接走
+# /tmp/uv-venv/bin/python（或 $UV_PROJECT_ENVIRONMENT/bin/python），绕过 uv 入口。
+uv sync --frozen --extra flash-attn
 ```
 
 ---

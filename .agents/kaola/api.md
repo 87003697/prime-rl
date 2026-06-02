@@ -32,8 +32,10 @@ echo $WANDB_API_KEY
 export HF_TOKEN="你的token"
 export WANDB_API_KEY="你的key"
 
-# 方式 2：在提交命令中传入
-koala submit -m normal -g 8 --sync-code .:/data/work/prime-rl \
+# 方式 2：在提交命令中传入（注意：v1.0.1 起 koala submit 用 --code，先 aws s3 sync 上传代码）
+S3=s3://arcwm-code-us-west-2/$USER/prime-rl
+aws s3 sync . "$S3/" --exclude '.git/*' --exclude '.venv/*' --exclude '*/__pycache__/*' --quiet
+koala submit -m normal -g 8 --code "$S3:/data/work/prime-rl" \
     -c "export HF_TOKEN=xxx && export WANDB_API_KEY=yyy && export EXP_NAME=blendergym-9b-dp6 && cd /data/work/prime-rl && . scripts/setup_kaola.sh --env blendergym && uv run rl @ configs/multimodal/rl_blendergym_kaola.toml --ckpt.output_dir /local-ssd/checkpoints/\${EXP_NAME}"
 ```
 

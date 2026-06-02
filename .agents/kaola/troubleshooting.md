@@ -4,6 +4,138 @@
 
 ---
 
+## 2026-06-02 — V2 训练 11 小时后被外部 SIGKILL（cleanPodPolicy + TTL 默认值）
+
+### 现象
+
+- `articraft-0601-phase2-v2tools` 训练 ~11h 后所有进程在 **2 秒窗口内全部停笔**（trainer.log / orchestrator.log / inference.log / env_server.log / per-rank torchrun stdout/stderr —— 11 个文件 mtime 都在 02:50:58 ~ 02:51:00 之间）
+- **零应用层 traceback**：grep `SIGTERM` / `Shutting down` / `Traceback` / `OOM` / `RuntimeError` 全 0 命中
+- wandb 没有 `wandb.finish()` / `defer` 事件，后端会标 run 为 `crashed`
+- `koala list` 任务消失，`koala logs --previous` 报 `pods not found`
+
+### 排查路径
+
+1. 检查所有日志最后一行：trainer 在 `Step 31 SUCCESS` 后无任何输出（不是 hang，是被砍）
+2. 跑遍次级日志：`logs/trainer/torchrun/*/attempt_0/{0,1}/{stdout,stderr}.log`、`logs/envs/{train,eval}/*/env_server.log`、`output/wandb/run-*/debug-internal.log`、`output/run_default/wandb/*` —— 没有任何一个能告诉你为什么死
+3. `koala get <task>` 返回 `Status=Failed`、`Reason="1 Master replica(s) failed"`、`Failed @ 19:07:21Z`（**比应用静默晚 16 分钟** —— 这是 K8s grace period 的指纹）
+4. 服务端能拿到的就到此为止：pod-level `containerStatuses.lastState.terminated.{exitCode, reason, signal}`、k8s `Events`（`OOMKilled` / `Evicted` / `Preempted` / `DeadlineExceeded`）**全部因 Pod 已删而无法获取**
+
+### 根因
+
+PyTorchJob 默认 `cleanPodPolicy: All` + `ttlSecondsAfterFinished: 3600s`：master 任一异常退出后所有 pod 立即被销毁，1h 后整个 job 也被 GC。诊断窗口只有 **<1 小时**，醒来时只剩 job-level 一句话。
+
+### 解决
+
+- **提交 spec 改 `cleanPodPolicy: OnSuccess`、`ttlSecondsAfterFinished >= 86400`**（保 24h）
+- 长跑训练同时开 `setup_kaola.sh` 的 EXIT trap `sync_all` 兜底拉走 `/local-ssd/prime-rl-output/`
+- 短期对策：在 setup 脚本里起一个 dmesg / `kubectl get events` sidecar 写到 `/local-ssd/`，被 EXIT trap 同步到 S3，绕开 cleanPodPolicy 清理
+
+### 教训
+
+- "训练突然停且 pod 已被清理" = 几乎必然是 K8s 层 GC，不要再去翻应用层 traceback 浪费时间
+- 看见 11 个独立进程在 2 秒内同步沉默 → 进程组级 SIGKILL（cgroup OOMKill / 节点 evict / preempt），单个进程异常做不到这种时序
+- 同期烟测撞上 2 个 hyperpod-i-* 节点挂载故障（见下条）—— 集群本身的节点级失败率可能是 11h kill 的真正源头
+
+### 相关
+
+- `debugging.md` §6 速查表新增"训练突然停且 pod 已被清理"行
+- 见下方 `2026-06-02 — koala submit 短时间多发节点存储故障` 条目
+
+---
+
+## 2026-06-02 — uv sync --locked 在 verifiers/color-codeword 上 re-lock 失败
+
+### 现象
+
+- 合并 upstream/main 60 个 commit 后，pod 内 `setup_kaola.sh` 卡在 `uv sync --locked --extra flash-attn`
+- 报错：
+
+  ```
+  × No solution found when resolving dependencies for split (markers:
+    python_full_version == '3.12.*' and platform_machine == 'x86_64' and
+    sys_platform == 'linux'):
+    ╰─▶ Because prime-rl[envs] depends on color-codeword and
+        color-codeword==0.1.0 depends on verifiers>=0.1.15.dev17, we can
+        conclude that prime-rl[envs] depends on verifiers>=0.1.15.dev17.
+        And because only verifiers<0.1.15.dev17 is available and your workspace
+        requires prime-rl[envs], we can conclude that your workspace's
+        requirements are unsatisfiable.
+  ```
+- **纯上游 `pyproject + uv.lock` 也会复现** —— 不是合并冲突引入的
+
+### 根因
+
+- `pyproject.toml` 用 `tool.uv.exclude-newer = "7 days"` 强制只看 7 天内发布的包元数据
+- `verifiers` 是 git pin（rev=`3b77145`，自报 `0.1.13.dev8`），**lockfile 钉的版本是固定的**
+- 但 `color-codeword 0.1.0` 在 primeintellect index 上的元数据**被刷新**，新声明 `verifiers >= 0.1.15.dev17`
+- `--locked` 触发完整 re-resolve → 元数据冲突 → fail，即使**已锁定的 wheel hash 仍然彼此兼容**
+
+### 解决
+
+`scripts/setup_kaola.sh` 改用 `--frozen`（信任 lockfile，不重新解析）：
+
+```bash
+# v2 sync 起的修复（commit 56c58d41）
+uv sync --frozen --extra flash-attn
+```
+
+`--frozen` 与 `--locked` 的语义对比：
+
+| 标志 | 行为 | 适用 |
+|---|---|---|
+| `--locked` | 先重新解析 pyproject，再校验解析结果与 lockfile 一致 | CI 校验 lockfile 完整性 |
+| `--frozen` | 直接读 lockfile 安装，不解析 | 长跑容器（避开元数据漂移）|
+
+### 关联子坑：cwd 不在 workspace root 触发二次 re-lock
+
+- `uv run python -c "..."` / `uv pip install -e` 等命令在 cwd ≠ workspace root 时会按 cwd 解析项目配置，**再次触发 resolver** → 撞同样的 color-codeword 冲突
+- 表现：明明 `uv sync --frozen` 成功了，subprocess 里再用 `uv run` 又失败
+- **解决**：subprocess 内调用 python 时直接走 `${UV_PROJECT_ENVIRONMENT:-/tmp/uv-venv}/bin/python`，绕过 uv 入口。或者 `cd /data/work/prime-rl` 再调用。
+
+### 教训
+
+- 容器内长跑场景**永远 `--frozen`**；`--locked` 只用于 CI 校验
+- workspace root 是 uv 唯一安全 cwd
+- 见到 "No solution found when resolving" 加 "color-codeword / verifiers" → 直接换 `--frozen`，不要试图修元数据
+
+### 相关
+
+- 上游同步分支：`feat/v2-tool-set-upstream-sync`（commit 56c58d41）
+- `workflow.md` setup 命令已同步改 `--frozen`
+
+---
+
+## 2026-06-02 — koala submit 短时间多发节点存储故障
+
+### 现象
+
+同一 session 内 4 次 `koala submit`，**2 次** 撞上节点挂载故障：
+
+| 节点 | 现象 |
+|---|---|
+| `hyperpod-i-056d23b0f9e54e25b` | debug pod 卡 `Updating` 36 分钟，跳板机 SSH init 失败（`apt-get install openssh-server` exit code 1）|
+| `hyperpod-i-03187f43395e2d699` | normal pod 启动后 5 min 触发 koala 告警 "节点侧存储挂载故障" |
+
+### 处理
+
+- `koala delete --force <task>` 强制删除卡死的 pod
+- **CLI 自动**记录所在节点到 `~/.cache/koala-cli/bad_nodes.json`（12h 自动避开）
+- 验证：`koala nodes list`
+- 重新 `koala submit` 后 90 秒就 Running（避开了坏节点）
+
+### 经验
+
+- 节点黑名单 cheat sheet 在共享层 `codes/.agents/koala/workflow.md` 已有完整覆盖（block / unblock / clear），不重复写
+- **关键观察**：同一上午 2/4 = 50% 节点故障率不是孤例，与 v2 训练 11h kill 的"外部 SIGKILL"假设强相关
+- 提交频繁失败时不要原地重试（会再次撞同样的坏节点），先 `koala nodes list` 确认黑名单，再换名字提交
+
+### 相关
+
+- 上方 `2026-06-02 — V2 训练 11 小时后被外部 SIGKILL` 条目
+- 共享 `codes/.agents/koala/workflow.md` § "故障节点黑名单 (v1.0.1)"
+
+---
+
 ## 2026-05-25 — Orchestrator 启动 2 秒 crash（env_id 模块名冲突）
 
 ### verifiers env_id 必须与 importable Python module name 完全一致
@@ -77,6 +209,34 @@ if [ $rc -ne 0 ]; then \
   done; \
 fi; exit $rc
 ```
+
+#### 短命令 / 不走 setup_kaola.sh 的场景（烟测、单步验证）
+
+EXIT trap 只在 `setup_kaola.sh` 里设。**短命令脚本（如烟测）不会触发它**，且 normal pod 的 stdout 不会自动同步到 S3。这种场景下脚本要**自己 push 到 S3**：
+
+```bash
+#!/bin/bash
+LOG=/local-ssd/v2_smoke.log
+S3_OUT=s3://arcwm-code-us-west-2/$USER/<project>/output
+
+mkdir -p /local-ssd
+exec > >(tee -a "$LOG") 2>&1     # tee 到本地日志 + stdout
+
+# 每个关键阶段后调用，把当前日志推到 S3
+push_log() { aws s3 cp "$LOG" "$S3_OUT/v2_smoke.log" --quiet 2>/dev/null || true; }
+
+push_log
+... 各种验证步骤 ...
+push_log
+... 最后一步前 ...
+sleep 2
+aws s3 cp "$LOG" "$S3_OUT/v2_smoke.log"   # 显式最终同步（不用 trap）
+```
+
+**注意**：
+- 不要依赖 background uploader（`( while true; do aws s3 cp...; sleep 10; done ) &` + `trap`），normal pod cmd 退出后会 SIGKILL 整个进程组，trap 没机会执行
+- 显式在每个步骤后同步是最可靠的，也方便实时观察进度（Mac 上 `aws s3 cp ... -` 即可流式拉）
+- 实际验证：本次 v2-sync 烟测前 5 次提交因为依赖 `koala logs` / EXIT trap 都丢了输出，第 6 次改成 `push_log()` 显式同步成功
 
 ---
 

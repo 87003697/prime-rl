@@ -58,8 +58,10 @@ flowchart TD
 
 ```bash
 cd ~/Desktop/codes/prime-rl
-koala submit --sync-code .:/data/work/prime-rl
-ssh <pod名>
+S3=s3://arcwm-code-us-west-2/$USER/prime-rl
+aws s3 sync . "$S3/" --exclude '.git/*' --exclude '.venv/*' --exclude '*/__pycache__/*' --quiet
+koala submit --code "$S3:/data/work/prime-rl"
+ssh koala                          # v1.1.0 自动配置 Host koala
 
 cd /data/work/prime-rl
 export EXP_NAME=blendergym-9b-dp6
@@ -69,9 +71,9 @@ export EXP_NAME=blendergym-9b-dp6
 ### 热更新代码（不重建 pod）
 
 ```bash
-# Mac 端：推送修改的文件
-scp -P <port> path/to/modified_file.py \
-    root@<jumpserver>:/data/work/prime-rl/path/to/modified_file.py
+# Mac 端：直接 rsync 到 pod，不必经 S3
+rsync -avz --exclude '.git' --exclude '.venv' --exclude '__pycache__' \
+    ./ koala:/data/work/prime-rl/
 ```
 
 blendergym 用 editable install（`uv pip install -e`），源文件修改直接生效。验证方法：
@@ -308,3 +310,4 @@ signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 | `RuntimeError: Existing processes found on GPUs` | 服务进程在 `check_gpus_available` 前占用了 GPU | 检查 CLIP/Blender 是否提前加载模型到 GPU |
 | Render 请求超时（`httpx.ReadTimeout`） | Blender 渲染卡死或 OPTIX 首次编译 | 检查 OPTIX cache（`/root/.nv/ComputeCache`）是否存在 |
 | Score 请求返回 500 | CLIP 模型加载失败或 GPU OOM | 查 `score_diag.log`；`nvidia-smi` 检查显存 |
+| 训练突然停且 pod 已被清理（无现场） | K8s 层 GC：`cleanPodPolicy: All` + `ttlSecondsAfterFinished` 默认 1h | 提交 spec 改 `OnSuccess` + TTL ≥ 86400s；详见 `troubleshooting.md` 2026-06-02 V2 训练 11h SIGKILL 条目 |
