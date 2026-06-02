@@ -203,3 +203,4 @@ outputs/
 # BlenderGym dataset + reference codes (large binaries / models, kept locally)
 data/blendergym/
 _reference_codes/
+third_party/
