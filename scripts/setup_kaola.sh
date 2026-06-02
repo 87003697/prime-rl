@@ -43,6 +43,13 @@ fi
 
 # --- 环境变量 ---
 export HF_HOME="/local-ssd/hf_cache"
+# UV_FROZEN=1: 让所有 uv run / uv pip 信任 lockfile，禁用隐式重解析。
+# 没有这一行，`uv run rl @ config.toml` 启动时会重解析 pyproject，撞上
+# 7-day exclude-newer 窗口下 color-codeword 元数据漂移（声明
+# verifiers>=0.1.15.dev17，但 lock 钉的 verifiers 自报 0.1.13.dev8），
+# 导致训练命令在所有 setup 完成后才崩。setup_python_deps 用 --frozen
+# 不够，因为 uv run 默认会做隐式 sync。
+export UV_FROZEN=1
 if [ -z "${HF_TOKEN:-}" ]; then
     echo "WARNING: HF_TOKEN not set."
 fi
