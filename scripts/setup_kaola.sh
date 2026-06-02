@@ -123,7 +123,11 @@ setup_hf_cache() {
 # 安装 prime-rl 主框架的 Python 依赖（含 flash-attn 加速库）。
 setup_python_deps() {
     echo "  Python dependencies..."
-    uv sync --locked --extra flash-attn
+    # --frozen: 严格按 uv.lock 安装，不重新解析 pyproject。
+    # 之前用 --locked 会触发完整解析，被 7-day exclude-newer 窗口下
+    # color-codeword/verifiers 元数据漂移坑过（lockfile 钉的版本看似不满足
+    # 当前 PyPI 上元数据声明的依赖范围）。--frozen 直接信任锁文件。
+    uv sync --frozen --extra flash-attn
 }
 
 # 启动后台进程，每 5 分钟将本地 SSD 上的训练产出同步到 S3（持久化）。
