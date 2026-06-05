@@ -3,15 +3,17 @@
 # KOALA 环境恢复脚本 — 通用编排器
 # ============================================================================
 # 用法：
-#   . scripts/setup_kaola.sh [--fast] [--resume] [--env blendergym]
+#   . scripts/setup_kaola.sh [--resume] [--env blendergym]
 #
-# --fast   debug 模式（跳过数据集拷贝和 warmup）
 # --resume 从已有 checkpoint 恢复训练（跳过 S3 output 存在检查）
 # --env    环境插件名称（默认 blendergym），对应 scripts/envs/<name>.sh
 #
 # 注意：此脚本通过 source 执行（. scripts/setup_kaola.sh），set -euo pipefail
 # 会影响调用方 shell。通过 koala submit -c 执行时无副作用（一次性 shell）；
 # 在交互式 shell 中 source 时，后续命令也会受 set -e 约束。
+#
+# v1.4.0 适配（2026-06）：默认不挂 /threed-code FUSE，所有 tar 通过
+# `s5cmd cat s3://...` 直接从 S3 拉取并管道解压，无需挂载。
 #
 # 环境变量（提交命令中 export）：
 #   EXP_NAME      实验名称（必须设置，无默认值）
@@ -22,13 +24,11 @@
 set -euo pipefail
 
 # --- 参数解析 ---
-FAST_MODE=false
 RESUME_MODE=false
 ENV_NAME="blendergym"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --fast) FAST_MODE=true; shift ;;
         --resume) RESUME_MODE=true; shift ;;
         --env)
             if [[ $# -lt 2 ]]; then echo "ERROR: --env requires a name"; exit 1; fi
@@ -36,10 +36,6 @@ while [[ $# -gt 0 ]]; do
         *)  echo "Unknown option: $1"; exit 1 ;;
     esac
 done
-
-if [ "$FAST_MODE" = true ]; then
-    echo ">>> Fast mode: skip dataset copy & warmup"
-fi
 
 # --- 环境变量 ---
 export HF_HOME="/local-ssd/hf_cache"
@@ -84,25 +80,26 @@ fi
 HF_MODEL="${HF_MODEL:-Qwen/Qwen3.5-9B}"
 HF_MODEL_SHORT=$(echo "${HF_MODEL}" | awk -F'/' '{print $NF}' | tr '[:upper:]' '[:lower:]')
 
-S3_PREFIX="/threed-code/ericzyma"
-S3_EXP="${S3_PREFIX}/experiments/${EXP_NAME}"
+# v1.4.0: 不再依赖 /threed-code FUSE。所有 S3 资源通过 s5cmd 走 API 拉取。
+# S3_PREFIX_URI 是 env 插件（articraft.sh / blendergym.sh）派生 tar URI 的根。
+S3_PREFIX_URI="s3://arcwm-code-us-west-2/ericzyma"
 OUTPUT_LOCAL="/local-ssd/prime-rl-output"
 CKPT_LOCAL="/local-ssd/checkpoints/${EXP_NAME}"
-CKPT_S3="${S3_EXP}/checkpoints"
-OUTPUT_S3="${S3_EXP}/output"
 
-# S3 API 路径（绕过 FUSE，用于写入）— FUSE 路径只用于读取/存在性检查
-S3_BUCKET="s3://arcwm-code-us-west-2/ericzyma"
-CKPT_S3_BUCKET="${S3_BUCKET}/experiments/${EXP_NAME}/checkpoints"
-OUTPUT_S3_BUCKET="${S3_BUCKET}/experiments/${EXP_NAME}/output"
-HF_CACHE_TAR="${S3_PREFIX}/tools/hf_cache_${HF_MODEL_SHORT}.tar"
+CKPT_S3_BUCKET="${S3_PREFIX_URI}/experiments/${EXP_NAME}/checkpoints"
+OUTPUT_S3_BUCKET="${S3_PREFIX_URI}/experiments/${EXP_NAME}/output"
+HF_CACHE_TAR_URI="${S3_PREFIX_URI}/tools/hf_cache_${HF_MODEL_SHORT}.tar"
 PROJECT_DIR="/data/work/prime-rl"
 
-if [ "$FAST_MODE" = false ] && [ "$RESUME_MODE" = false ] && [ -d "${OUTPUT_S3}/logs" ]; then
-    echo "ERROR: S3 output already exists: ${OUTPUT_S3}/logs"
+# Guard：防止重投覆盖已有实验。`aws s3 ls --summarize` 在 prefix 有内容时
+# 输出包含 "Total Objects:" 行且 >0；prefix 不存在或为空时为 0。
+if [ "$RESUME_MODE" = false ] \
+   && aws s3 ls "${OUTPUT_S3_BUCKET}/logs/" --summarize 2>/dev/null \
+        | grep -q '^Total Objects: [1-9]'; then
+    echo "ERROR: S3 output already exists: ${OUTPUT_S3_BUCKET}/logs/"
     echo "  Previous training data would be overwritten."
     echo "  To resume:      add --resume"
-    echo "  To start fresh:  rclone purge threed-code:arcwm-code-us-west-2/${S3_EXP#/threed-code/}"
+    echo "  To start fresh: rclone purge threed-code:arcwm-code-us-west-2/ericzyma/experiments/${EXP_NAME}"
     echo "  Or use a different EXP_NAME."
     exit 1
 fi
@@ -115,15 +112,15 @@ fi
 # tar 文件路径由 HF_MODEL 派生：Qwen/Qwen3.5-9B → hf_cache_qwen3.5-9b.tar
 setup_hf_cache() {
     echo "  HF model cache (${HF_MODEL})..."
-    if [ ! -d "${HF_HOME}/hub" ]; then
-        if [ -f "${HF_CACHE_TAR}" ]; then
-            cat "${HF_CACHE_TAR}" | tar xf - -C /local-ssd
-            echo "    Restored from ${HF_CACHE_TAR}"
-        else
-            echo "    No tar at ${HF_CACHE_TAR}, will download on first use"
-        fi
-    else
+    if [ -d "${HF_HOME}/hub" ]; then
         echo "    Already present, skipping"
+        return
+    fi
+    if s5cmd ls "${HF_CACHE_TAR_URI}" &>/dev/null; then
+        s5cmd cat "${HF_CACHE_TAR_URI}" | tar xf - -C /local-ssd
+        echo "    Restored from ${HF_CACHE_TAR_URI}"
+    else
+        echo "    No tar at ${HF_CACHE_TAR_URI}, will download on first use"
     fi
 }
 
@@ -162,10 +159,6 @@ setup_watchdog() {
 # 启动后台进程，每 5 分钟将本地 SSD 上的训练产出同步到 S3（持久化）。
 # shell EXIT 时触发最终同步，确保训练结束后不丢数据。
 setup_s3_sync() {
-    if [ "$FAST_MODE" = true ]; then
-        echo "  Background sync: SKIPPED (fast mode)"
-        return
-    fi
     echo "  Starting background S3 sync..."
     setup_watchdog
     sync_all() {

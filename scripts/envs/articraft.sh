@@ -12,9 +12,8 @@
 #   然后调用 env_setup() 函数执行所有准备步骤。
 #
 # 可用的 base 变量（setup_kaola.sh source 时已定义）：
-#   $S3_PREFIX    — S3 FUSE 挂载的用户根目录，如 /threed-code/ericzyma
-#   $FAST_MODE    — "true" 时跳过非必要步骤（debug 快速启动用）
-#   $PROJECT_DIR  — prime-rl 代码在容器内的路径，如 /data/work/prime-rl
+#   $S3_PREFIX_URI — S3 用户根 URI，如 s3://arcwm-code-us-west-2/ericzyma
+#   $PROJECT_DIR   — prime-rl 代码在容器内的路径，如 /data/work/prime-rl
 #
 # 函数命名约定：
 #   所有函数用 setup_ac_ 前缀（Articraft 缩写），避免和 base 脚本或其他
@@ -27,11 +26,9 @@
 # Phase 2: shipped with prime-rl under environments/articraft/source/
 ARTICRAFT_DIR="${PROJECT_DIR}/environments/articraft/source"
 
-# ARTICRAFT_CODE_TAR: 代码 tar 包在 S3 FUSE 上的路径（~16MB，含 sdk/agent/cli 等，不含 data/records）
-ARTICRAFT_CODE_TAR="${S3_PREFIX}/data/articraft/articraft-code.tar"
-
-# ARTICRAFT_DATASET_TAR: 数据集 tar 包在 S3 FUSE 上的路径（~1GB，含 10065 条 record）
-ARTICRAFT_DATASET_TAR="${S3_PREFIX}/data/articraft/articraft-dataset-4-5star.tar"
+# ARTICRAFT_DATASET_TAR_URI: 数据集 tar 在 S3 上的 URI（~1GB，含 10065 条 record）
+# v1.4.0: 通过 s5cmd cat 直接从 S3 拉取，不再依赖 /threed-code FUSE 挂载
+ARTICRAFT_DATASET_TAR_URI="${S3_PREFIX_URI}/data/articraft/articraft-dataset-4-5star.tar"
 
 # ARTICRAFT_DATASET_LOCAL: 数据集解压后的本地 SSD 路径（NVMe，读写快）
 ARTICRAFT_DATASET_LOCAL="/local-ssd/data/articraft"
@@ -42,7 +39,6 @@ ARTICRAFT_DATASET_LOCAL="/local-ssd/data/articraft"
 #   已内嵌在 prime-rl 仓库 environments/articraft/source/ 目录下，
 #   通过 s5cmd sync prime-rl 代码时一并部署，不再需要从 S3 解压 tar 包。
 # 此函数仅做存在性验证：检查 agent/ 子目录是否存在，打印文件数。
-# ARTICRAFT_CODE_TAR 变量保留但不再使用（向后兼容，如果未来需要回退到 tar 模式）。
 setup_ac_sync_code() {
     echo "  [env] Articraft source is at ${ARTICRAFT_DIR} (shipped with prime-rl)"
     if [ ! -d "${ARTICRAFT_DIR}/agent" ]; then
@@ -54,11 +50,9 @@ setup_ac_sync_code() {
 
 
 # --- 步骤 2: 解压数据集到本地 SSD ---
-# 从 S3 FUSE 读取 tar 包，解压 10065 条 record 到本地 NVMe SSD。
-# 为什么用 tar 管道而不是 cp -r：S3 FUSE 上 cp 大量小文件极慢（每文件一次 S3 API），
-#   tar 管道是单次顺序读取一个大文件，实测快 30 倍（39s vs 20min）。
-# 为什么放本地 SSD 而不是直接读 FUSE：训练时每个 rollout 都要读 record.json + model.py，
-#   本地 SSD 随机读延迟 <1ms，FUSE 每次要走网络约 10-50ms。
+# 从 S3 通过 s5cmd cat 流式拉取 tar 包，直接管道解压到本地 NVMe SSD。
+# 为什么放本地 SSD 而不是直接读 S3：训练时每个 rollout 都要读 record.json + model.py，
+#   本地 SSD 随机读延迟 <1ms，远快于 S3 API 每次 ~10-50ms。
 # --strip-components=1: tar 包内顶层有一个目录（如 dataset/），解压时去掉它。
 # 最后创建 symlink：让 articraft 代码树的 data/records/ 指向本地 SSD 上的数据，
 #   这样 dataset.py 的 `root / "data" / "records"` 路径能找到数据。
@@ -67,16 +61,18 @@ setup_ac_restore_dataset() {
     echo "  [env] Restoring articraft dataset..."
     if [ -d "${ARTICRAFT_DATASET_LOCAL}/records" ]; then
         echo "    Already present, skipping"
-    elif [ -f "${ARTICRAFT_DATASET_TAR}" ]; then
+    elif s5cmd ls "${ARTICRAFT_DATASET_TAR_URI}" &>/dev/null; then
         mkdir -p "${ARTICRAFT_DATASET_LOCAL}"
-        # cat + tar 管道：从 FUSE 顺序读 tar → 直接解压到本地 SSD
-        cat "${ARTICRAFT_DATASET_TAR}" | tar xf - -C "${ARTICRAFT_DATASET_LOCAL}/" --strip-components=1 --warning=no-unknown-keyword
+        # s5cmd cat 直接从 S3 流式输出 tar bytes 到 stdout，管道给 tar 解压
+        s5cmd cat "${ARTICRAFT_DATASET_TAR_URI}" \
+            | tar xf - -C "${ARTICRAFT_DATASET_LOCAL}/" \
+                --strip-components=1 --warning=no-unknown-keyword
         echo "    Extracted to ${ARTICRAFT_DATASET_LOCAL} ($(ls ${ARTICRAFT_DATASET_LOCAL}/records/ | wc -l) records)"
     else
-        echo "    WARNING: dataset tar not found at ${ARTICRAFT_DATASET_TAR}"
+        echo "    WARNING: dataset tar not found at ${ARTICRAFT_DATASET_TAR_URI}"
         echo "    Training will fail if no records are available."
     fi
-    # 创建符号链接：让 /data/work/articraft/data/records → /local-ssd/data/articraft/records
+    # 创建符号链接：让 ${ARTICRAFT_DIR}/data/records → /local-ssd/data/articraft/records
     # -s: 创建符号链接（而非拷贝）
     # -f: 如果已存在则覆盖
     # -n: 如果目标是符号链接到目录，替换它而非在里面创建

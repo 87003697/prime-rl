@@ -5,14 +5,15 @@
 # 实现 env_setup()，由 base 脚本在主流程中调用。
 #
 # 可用的 base 变量（source 时已定义）：
-#   $S3_PREFIX    — S3 FUSE 挂载的用户根目录
-#   $FAST_MODE    — true 时跳过数据集拷贝和 OPTIX warmup（debug 用）
-#   $PROJECT_DIR  — prime-rl 代码目录
-#   $OUTPUT_LOCAL — 训练输出本地路径
-#   $EXP_NAME    — 实验名称
+#   $S3_PREFIX_URI — S3 用户根 URI，如 s3://arcwm-code-us-west-2/ericzyma
+#   $PROJECT_DIR   — prime-rl 代码目录
+#   $OUTPUT_LOCAL  — 训练输出本地路径
+#   $EXP_NAME     — 实验名称
 #
 # 约定：顶层只定义变量和函数。所有副作用（IO、安装）在 env_setup() 内执行。
 # 函数命名用 setup_bg_ 前缀（BlenderGym）避免与 base 或其他 env 插件冲突。
+# v1.4.0 适配（2026-06）：所有 tar 通过 s5cmd cat 从 S3 直接拉取，不再依赖
+# /threed-code FUSE 挂载。
 # ============================================================================
 
 # --- BlenderGym 专属路径 ---
@@ -20,7 +21,10 @@ BLENDER_VERSION="4.2.0"
 BLENDER_DIR="/local-ssd/blender-${BLENDER_VERSION}-linux-x64"
 BLENDER_BIN="${BLENDER_DIR}/blender"
 DATA_DIR="/local-ssd/blendergym"
-OPTIX_CACHE_TAR="${S3_PREFIX}/tools/optix_cache.tar"
+
+BLENDER_TAR_URI="${S3_PREFIX_URI}/tools/blender-${BLENDER_VERSION}-linux-x64.tar"
+BLENDERGYM_TAR_URI="${S3_PREFIX_URI}/data/blendergym.tar"
+OPTIX_CACHE_TAR_URI="${S3_PREFIX_URI}/tools/optix_cache.tar"
 
 setup_bg_install_system_libs() {
     echo "  [env] Installing system libraries (libegl1)..."
@@ -32,8 +36,7 @@ setup_bg_install_system_libs() {
 setup_bg_restore_blender() {
     echo "  [env] Restoring Blender ${BLENDER_VERSION}..."
     if [ ! -f "${BLENDER_BIN}" ]; then
-        cat "${S3_PREFIX}/tools/blender-${BLENDER_VERSION}-linux-x64.tar" \
-            | tar xf - -C /local-ssd
+        s5cmd cat "${BLENDER_TAR_URI}" | tar xf - -C /local-ssd
         echo "    Blender extracted"
     else
         echo "    Already present, skipping"
@@ -42,21 +45,12 @@ setup_bg_restore_blender() {
 
 setup_bg_restore_dataset() {
     echo "  [env] Restoring dataset..."
-    if [ "$FAST_MODE" = true ]; then
-        ln -sfn "${S3_PREFIX}/data/blendergym" "${DATA_DIR}"
-        echo "    Symlinked to S3 (fast mode)"
+    if [ ! -d "${DATA_DIR}/placement1" ]; then
+        s5cmd cat "${BLENDERGYM_TAR_URI}" | tar xf - -C /local-ssd
+        mv /local-ssd/bench_data "${DATA_DIR}"
+        echo "    Restored from tar ($(du -sh "${DATA_DIR}" | cut -f1))"
     else
-        if [ -L "${DATA_DIR}" ]; then
-            echo "    Removing fast-mode S3 symlink"
-            rm "${DATA_DIR}"
-        fi
-        if [ ! -d "${DATA_DIR}/placement1" ]; then
-            cat "${S3_PREFIX}/data/blendergym.tar" | tar xf - -C /local-ssd
-            mv /local-ssd/bench_data "${DATA_DIR}"
-            echo "    Restored from tar ($(du -sh "${DATA_DIR}" | cut -f1))"
-        else
-            echo "    Already present, skipping"
-        fi
+        echo "    Already present, skipping"
     fi
 }
 
@@ -74,8 +68,8 @@ setup_bg_optix_warmup() {
         echo "    Already present, skipping"
         return
     fi
-    if [ -f "${OPTIX_CACHE_TAR}" ]; then
-        cat "${OPTIX_CACHE_TAR}" | tar xf - -C /root
+    if s5cmd ls "${OPTIX_CACHE_TAR_URI}" &>/dev/null; then
+        s5cmd cat "${OPTIX_CACHE_TAR_URI}" | tar xf - -C /root
         echo "    Restored from S3 tar"
         return
     fi
@@ -89,7 +83,10 @@ setup_bg_optix_warmup() {
         --gpu 0 --resolution 64 --samples 1 \
         --compute-device OPTIX --timeout 600
     rm -rf /local-ssd/warmup-render
-    tar cf "${OPTIX_CACHE_TAR}" -C /root .nv
+    # 先打包到本地，再用 s5cmd cp 上传（s5cmd 不支持 stdin → S3 stream）
+    tar cf /tmp/optix_cache.tar -C /root .nv
+    s5cmd cp /tmp/optix_cache.tar "${OPTIX_CACHE_TAR_URI}"
+    rm -f /tmp/optix_cache.tar
     echo "    Compiled and saved to S3"
 }
 
@@ -104,11 +101,7 @@ env_setup() {
 
     # OPTIX warmup must complete before starting Render Service to avoid
     # 6 Blender workers simultaneously JIT-compiling OPTIX kernels (OOM).
-    if [ "$FAST_MODE" = true ]; then
-        echo "  [env] OPTIX warm-up: SKIPPED (fast mode)"
-    else
-        setup_bg_optix_warmup
-    fi
+    setup_bg_optix_warmup
 
     LOG_DIR="/local-ssd/prime-rl-output/logs"
     mkdir -p "$LOG_DIR"
